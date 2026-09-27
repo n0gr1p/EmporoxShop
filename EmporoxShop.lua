@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.1.2'
+_addon.version = '0.1.3'
 _addon.commands = {'emps', 'emporoxshop'}
 
 local packets = require('packets')
@@ -47,6 +47,7 @@ local session = {
     last_ack_packet = nil,
     item_ack_seen = false,
     dialog_ready_seen = false,
+    active_purchase_number = nil,
 }
 
 local function clear_session()
@@ -67,6 +68,7 @@ local function clear_session()
     session.last_ack_packet = nil
     session.item_ack_seen = false
     session.dialog_ready_seen = false
+    session.active_purchase_number = nil
 end
 
 local function abort_session(reason)
@@ -248,6 +250,7 @@ local function inject_purchase()
     local before = inventory_item_count(session.item_id)
     session.item_ack_seen = false
     session.dialog_ready_seen = false
+    session.active_purchase_number = session.purchased + 1
 
     local packet = packets.new('outgoing', 0x05B, session.template)
     packets.inject(packet)
@@ -313,6 +316,7 @@ local function begin_buy(item_name, quantity)
     session.started_inventory_count = inventory_item_count(item_id)
     session.item_ack_seen = false
     session.dialog_ready_seen = false
+    session.active_purchase_number = 1
 
     chat(string.format(
         'Armed for %d x %s (item id %d). Emporox is %.2f yalms away.',
@@ -430,17 +434,29 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
         -- can release the next automated purchase.
         session.item_ack_seen = false
         session.dialog_ready_seen = false
+        session.active_purchase_number = 1
         session.ack_deadline = now() + ACK_TIMEOUT_SECONDS
         chat('Observed manual Emporox menu selection: ' .. packet_summary(session.candidate))
         return
     end
 
-    -- Emporox may emit one final non-injected menu response immediately after
-    -- an item is received. Ignore that expected cleanup during the short
-    -- settling window. Outside that window, manual input means the player is
-    -- taking control, so stop instead of competing with it.
+    -- When Emporox's 0x05C continuation reaches the normal client, the event
+    -- script emits this cleanup/return-to-list response. During an intermediate
+    -- bulk purchase that would leave the confirmation state we deliberately
+    -- preserve, so block it. The final purchase is allowed to clean up normally.
+    local is_cleanup =
+        tonumber(p['Option Index']) == 0 and
+        tonumber(p['_unknown1']) == 16384 and
+        not p['Automated Message']
+
+    if is_cleanup and session.active_purchase_number and
+       session.active_purchase_number < session.requested then
+        chat('Blocked intermediate Emporox dialog cleanup.')
+        return true
+    end
+
     if session.mode == 'settling' then
-        chat('Ignoring post-purchase Emporox menu cleanup: ' .. packet_summary(p))
+        chat('Ignoring post-purchase Emporox menu traffic: ' .. packet_summary(p))
         return
     end
 
@@ -463,8 +479,29 @@ windower.register_event('incoming chunk', function(id, data)
     if id == 0x05C and session.mode ~= 'idle' then
         if session.mode == 'teaching' or session.mode == 'waiting' then
             session.dialog_ready_seen = true
-            chat('Emporox dialog continuation received (0x05C).')
+
+            local purchase_number = session.active_purchase_number or (session.purchased + 1)
+            local intermediate = purchase_number < session.requested
+
+            if intermediate then
+                chat(string.format(
+                    'Emporox dialog continuation received (0x05C); holding confirmation state for purchase %d/%d.',
+                    purchase_number,
+                    session.requested
+                ))
+            else
+                chat('Final Emporox dialog continuation received (0x05C); allowing normal menu cleanup.')
+            end
+
             maybe_schedule_next()
+
+            -- Critical for bulk replay: do not let the normal client consume
+            -- intermediate continuations. If it does, its event script returns
+            -- to the item list and the learned Yes packet is no longer valid.
+            -- Allow the final continuation through so the UI returns to normal.
+            if intermediate then
+                return true
+            end
         end
         return
     end
