@@ -1,6 +1,6 @@
 # EmporoxShop
 
-Windower addon for buying Ghastly Stones from Emporox.
+Windower addon for bulk purchasing Skirmish stones from Emporox.
 
 ## Installation
 
@@ -10,12 +10,22 @@ Place the EmporoxShop folder in your Windower addons directory and load it:
 //lua l EmporoxShop
 ```
 
-## Usage
-
-Stand near Emporox in Reisenjima and run:
+## Supported items
 
 ```text
-//emps buy Ghastly Stone 190
+Ghastly Stone
+Verdigris Stone
+Wailing Stone
+```
+
+## Usage
+
+Stand near Emporox in Reisenjima and run one of:
+
+```text
+//emps buy Ghastly Stone 200
+//emps buy Verdigris Stone 200
+//emps buy Wailing Stone 200
 ```
 
 No manual menu selection is required.
@@ -23,9 +33,7 @@ No manual menu selection is required.
 ## Commands
 
 ```text
-//emps buy Ghastly Stone <quantity>
+//emps buy <item name> <quantity>
 //emps status
 //emps stop
 ```
-
-Currently only Ghastly Stone is supported.
