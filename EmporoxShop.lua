@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.2.3'
+_addon.version = '0.3.0'
 _addon.commands = {'emps','emporoxshop'}
 
 local packets = require('packets')
@@ -9,9 +9,11 @@ local socket_ok, socket = pcall(require, 'socket')
 
 local ZONE = 291
 local MENU = 9751
-local ITEM_ID = 3954
-local OPTION = 3
-local UNKNOWN1 = 6
+local PURCHASES = {
+    ['ghastly stone'] = { name='Ghastly Stone', item_id=3954, option=3, unknown1=6 },
+    ['verdigris stone'] = { name='Verdigris Stone', item_id=4033, option=3, unknown1=262 },
+    ['wailing stone'] = { name='Wailing Stone', item_id=3951, option=3, unknown1=518 },
+}
 local MAX_DISTANCE = 6
 local TIMEOUT = 4
 local DRAIN_TIMEOUT = 10
@@ -23,6 +25,7 @@ local s = {
     npc_id=nil, npc_index=nil, menu=nil, deadline=nil,
     open_attempts=0, last_open=nil, last_tick=0, last_raw={},
     start_count=0, last_potpourri=nil, recover_deadline=nil,
+    purchase=nil,
 }
 
 local function now()
@@ -40,7 +43,7 @@ local function item_count()
     if not inv then return 0 end
     local n = 0
     for _,slot in pairs(inv) do
-        if type(slot)=='table' and tonumber(slot.id)==ITEM_ID then
+        if type(slot)=='table' and tonumber(slot.id)==s.purchase.item_id then
             n = n + (tonumber(slot.count) or 0)
         end
     end
@@ -61,6 +64,7 @@ local function reset()
         npc_id=nil, npc_index=nil, menu=nil, deadline=nil,
         open_attempts=0, last_open=nil, last_tick=0, last_raw={},
         start_count=0, last_potpourri=pot, recover_deadline=nil,
+        purchase=nil,
     }
 end
 
@@ -172,8 +176,8 @@ local function send_next()
 
     packets.inject(packets.new('outgoing',0x05B,{
         ['Target']=s.npc_id,
-        ['Option Index']=OPTION,
-        ['_unknown1']=UNKNOWN1,
+        ['Option Index']=s.purchase.option,
+        ['_unknown1']=s.purchase.unknown1,
         ['Target Index']=s.npc_index,
         ['Automated Message']=true,
         ['_unknown2']=0,
@@ -184,7 +188,7 @@ local function send_next()
     s.sent = s.sent + 1
     s.mode = 'running'
     s.deadline = now()+TIMEOUT
-    chat(string.format('Sent Ghastly Stone purchase %d/%d.',s.sent,s.qty))
+    chat(string.format('Sent %s purchase %d/%d.',s.purchase.name,s.sent,s.qty))
 end
 
 local function poke()
@@ -203,14 +207,21 @@ local function poke()
     chat(string.format('Opening Emporox menu (%d/%d).',s.open_attempts,MAX_OPEN))
 end
 
-local function start(qty)
+local function start(item_name,qty)
     if s.mode ~= 'idle' then chat('Already busy. Use //emps stop.',167) return end
     qty = tonumber(qty)
     if not qty or qty < 1 or qty ~= math.floor(qty) then chat('Quantity must be a positive integer.',167) return end
 
+    local purchase=PURCHASES[tostring(item_name):lower()]
+    if not purchase then
+        chat('Supported items: Ghastly Stone, Verdigris Stone, Wailing Stone.',167)
+        return
+    end
+
     local npc,err = get_emporox()
     if not npc then chat(err,167) return end
 
+    s.purchase = purchase
     s.mode = 'opening'
     s.qty = qty
     s.sent = 0
@@ -227,7 +238,7 @@ local function start(qty)
     local player=windower.ffxi.get_player()
     local status=player and tonumber(player.status) or -1
 
-    chat(string.format('Starting %d x Ghastly Stone using Silmaril sequence.',qty))
+    chat(string.format('Starting %d x %s using Silmaril sequence.',qty,s.purchase.name))
     chat(string.format('Preflight player status=%s.',tostring(status)))
     chat('No manual menu selection is required.')
 
@@ -245,11 +256,7 @@ windower.register_event('addon command',function(...)
         local qty=tonumber(a[#a])
         local name={}
         for i=2,#a-1 do name[#name+1]=tostring(a[i]) end
-        if table.concat(name,' '):lower() ~= 'ghastly stone' then
-            chat('Currently supported: //emps buy Ghastly Stone <quantity>',167)
-            return
-        end
-        start(qty)
+        start(table.concat(name,' '),qty)
     elseif cmd=='status' then
         local current=item_count()
         local confirmed=confirmed_count()
@@ -259,7 +266,7 @@ windower.register_event('addon command',function(...)
     elseif cmd=='stop' or cmd=='cancel' then
         stop('cancelled by user')
     else
-        chat('//emps buy Ghastly Stone <quantity>')
+        chat('//emps buy <Ghastly Stone|Verdigris Stone|Wailing Stone> <quantity>')
         chat('//emps status')
         chat('//emps stop')
     end
@@ -331,13 +338,13 @@ windower.register_event('incoming chunk',function(id,data)
 
     if id==0x01F or id==0x020 then
         local ok,p=pcall(packets.parse,'incoming',data)
-        if ok and p and tonumber(p['Item'])==ITEM_ID then
+        if ok and p and tonumber(p['Item'])==s.purchase.item_id then
             local confirmed=confirmed_count()
             if confirmed > s.acks then
                 s.acks=confirmed
                 chat(string.format(
-                    'Inventory confirmed %d/%d Ghastly Stones (0x%03X stack count=%s).',
-                    s.acks,s.qty,id,tostring(p['Count'])))
+                    'Inventory confirmed %d/%d %s (0x%03X stack count=%s).',
+                    s.acks,s.qty,s.purchase.name,id,tostring(p['Count'])))
             end
 
             s.deadline=now()+(s.mode=='draining' and DRAIN_TIMEOUT or TIMEOUT)
@@ -416,7 +423,7 @@ windower.register_event('prerender',function()
         local confirmed=confirmed_count()
         if confirmed>s.acks then
             s.acks=confirmed
-            chat(string.format('Inventory confirmed %d/%d Ghastly Stones.',s.acks,s.qty))
+            chat(string.format('Inventory confirmed %d/%d %s.',s.acks,s.qty,s.purchase.name))
         end
         if confirmed>=s.qty then
             finish_or_drain('inventory-poll')
