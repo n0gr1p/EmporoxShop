@@ -5,6 +5,7 @@ _addon.commands = {'emps', 'emporoxshop'}
 
 local packets = require('packets')
 local res = require('resources')
+local socket_ok, socket = pcall(require, 'socket')
 
 local EMPOROX_NAME = 'Emporox'
 local MAX_NPC_DISTANCE = 6.0
@@ -13,6 +14,9 @@ local ACK_TIMEOUT_SECONDS = 2.50
 local TICK_SECONDS = 0.05
 
 local function now()
+    if socket_ok and socket and socket.gettime then
+        return socket.gettime()
+    end
     return os.clock()
 end
 
