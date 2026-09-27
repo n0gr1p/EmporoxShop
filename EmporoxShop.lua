@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.1.3'
+_addon.version = '0.1.4'
 _addon.commands = {'emps', 'emporoxshop'}
 
 local packets = require('packets')
@@ -9,8 +9,7 @@ local socket_ok, socket = pcall(require, 'socket')
 
 local EMPOROX_NAME = 'Emporox'
 local MAX_NPC_DISTANCE = 6.0
-local PURCHASE_DELAY_SECONDS = 0.10
-local ACK_TIMEOUT_SECONDS = 4.00
+local PROGRESS_TIMEOUT_SECONDS = 4.00
 local TICK_SECONDS = 0.05
 
 local function now()
@@ -33,21 +32,18 @@ local session = {
     item_id = nil,
     item_name = nil,
     requested = 0,
-    purchased = 0,
+    sent_count = 0,
+    acked_count = 0,
     npc_id = nil,
     npc_index = nil,
     zone_id = nil,
     candidate = nil,
     template = nil,
-    next_send_at = nil,
-    ack_deadline = nil,
+    template_verified = false,
+    deadline = nil,
     last_tick = 0,
     last_potpourri = nil,
     started_inventory_count = 0,
-    last_ack_packet = nil,
-    item_ack_seen = false,
-    dialog_ready_seen = false,
-    active_purchase_number = nil,
 }
 
 local function clear_session()
@@ -55,20 +51,17 @@ local function clear_session()
     session.item_id = nil
     session.item_name = nil
     session.requested = 0
-    session.purchased = 0
+    session.sent_count = 0
+    session.acked_count = 0
     session.npc_id = nil
     session.npc_index = nil
     session.zone_id = nil
     session.candidate = nil
     session.template = nil
-    session.next_send_at = nil
-    session.ack_deadline = nil
+    session.template_verified = false
+    session.deadline = nil
     session.last_tick = 0
     session.started_inventory_count = 0
-    session.last_ack_packet = nil
-    session.item_ack_seen = false
-    session.dialog_ready_seen = false
-    session.active_purchase_number = nil
 end
 
 local function abort_session(reason)
@@ -79,10 +72,7 @@ local function abort_session(reason)
 end
 
 local function item_name_matches(item, wanted)
-    if not item or not item.en or not wanted then
-        return false
-    end
-    return item.en:lower() == wanted:lower()
+    return item and item.en and wanted and item.en:lower() == wanted:lower()
 end
 
 local function find_item(name)
@@ -140,7 +130,11 @@ local function find_emporox()
         return nil, nil, 'could not determine distance to Emporox'
     end
     if distance >= MAX_NPC_DISTANCE then
-        return nil, distance, string.format('Emporox is %.2f yalms away; move within %.1f', distance, MAX_NPC_DISTANCE)
+        return nil, distance, string.format(
+            'Emporox is %.2f yalms away; move within %.1f',
+            distance,
+            MAX_NPC_DISTANCE
+        )
     end
 
     return npc, distance, nil
@@ -165,7 +159,8 @@ local function validate_session_npc()
     if npc.name ~= EMPOROX_NAME then
         return nil, nil, 'saved NPC is no longer Emporox'
     end
-    if tonumber(npc.id) ~= tonumber(session.npc_id) or tonumber(npc.index) ~= tonumber(session.npc_index) then
+    if tonumber(npc.id) ~= tonumber(session.npc_id) or
+       tonumber(npc.index) ~= tonumber(session.npc_index) then
         return nil, nil, 'Emporox identity changed'
     end
 
@@ -209,8 +204,9 @@ end
 local function finish_success()
     local current = inventory_item_count(session.item_id)
     chat(string.format(
-        'Complete: purchased %d x %s. Inventory count %d -> %d.',
-        session.purchased,
+        'Complete: received %d/%d x %s. Inventory count %d -> %d.',
+        session.acked_count,
+        session.requested,
         session.item_name,
         session.started_inventory_count,
         current
@@ -218,53 +214,45 @@ local function finish_success()
     clear_session()
 end
 
-local function maybe_schedule_next()
-    if not session.item_ack_seen or not session.dialog_ready_seen then
-        return
-    end
-
-    if session.purchased >= session.requested then
-        finish_success()
-        return
-    end
-
-    -- The item receipt proves the purchase succeeded. Incoming 0x05C proves
-    -- Emporox's dialog event has advanced and is ready to accept the next
-    -- identical menu response. Only advance when both have happened.
-    session.mode = 'settling'
-    session.next_send_at = now() + PURCHASE_DELAY_SECONDS
-    session.ack_deadline = nil
-end
-
-local function inject_purchase()
+local function inject_next_purchase()
     local _, _, reason = validate_session_npc()
     if reason then
         abort_session(reason)
-        return
+        return false
     end
     if not session.template then
         abort_session('no learned purchase packet is available')
-        return
+        return false
+    end
+    if session.sent_count >= session.requested then
+        return false
     end
 
-    local before = inventory_item_count(session.item_id)
-    session.item_ack_seen = false
-    session.dialog_ready_seen = false
-    session.active_purchase_number = session.purchased + 1
+    -- 0x05C for purchase N arrives before the inventory item packet for N.
+    -- Permit exactly one not-yet-observed item while chaining. If the previous
+    -- item ACK has fallen farther behind, fail closed instead of racing ahead.
+    local unacked = session.sent_count - session.acked_count
+    if unacked > 1 then
+        abort_session(string.format(
+            'inventory ACKs fell behind (%d sent, %d received)',
+            session.sent_count,
+            session.acked_count
+        ))
+        return false
+    end
 
-    local packet = packets.new('outgoing', 0x05B, session.template)
-    packets.inject(packet)
-
-    session.mode = 'waiting'
-    session.ack_deadline = now() + ACK_TIMEOUT_SECONDS
+    local next_number = session.sent_count + 1
+    packets.inject(packets.new('outgoing', 0x05B, session.template))
+    session.sent_count = next_number
+    session.mode = 'running'
+    session.deadline = now() + PROGRESS_TIMEOUT_SECONDS
 
     chat(string.format(
-        'Purchase %d/%d sent for %s; waiting for item ACK (inventory=%d).',
-        session.purchased + 1,
-        session.requested,
-        session.item_name,
-        before
+        'Purchase %d/%d sent immediately from Emporox continuation.',
+        session.sent_count,
+        session.requested
     ))
+    return true
 end
 
 local function begin_buy(item_name, quantity)
@@ -305,25 +293,26 @@ local function begin_buy(item_name, quantity)
     session.item_id = item_id
     session.item_name = item.en
     session.requested = quantity
-    session.purchased = 0
+    session.sent_count = 0
+    session.acked_count = 0
     session.npc_id = npc.id
     session.npc_index = npc.index
     session.zone_id = tonumber(info.zone)
     session.candidate = nil
     session.template = nil
-    session.next_send_at = nil
-    session.ack_deadline = nil
+    session.template_verified = false
+    session.deadline = nil
     session.started_inventory_count = inventory_item_count(item_id)
-    session.item_ack_seen = false
-    session.dialog_ready_seen = false
-    session.active_purchase_number = 1
 
     chat(string.format(
         'Armed for %d x %s (item id %d). Emporox is %.2f yalms away.',
-        quantity, item.en, item_id, distance
+        quantity,
+        item.en,
+        item_id,
+        distance
     ))
     chat('I will open Emporox. Navigate to the requested item and purchase ONE manually.')
-    chat('The addon will learn only the menu packet that immediately precedes the verified item receive packet.')
+    chat('After the Yes packet is captured, Emporox continuations will chain the remaining purchases.')
 
     packets.inject(packets.new('outgoing', 0x01A, {
         ['Target'] = npc.id,
@@ -341,28 +330,25 @@ local function show_status()
     local current = inventory_item_count(session.item_id)
     local pot = session.last_potpourri and tostring(session.last_potpourri) or 'unknown'
     chat(string.format(
-        'mode=%s item=%s purchased=%d/%d inventory=%d potpourri=%s',
+        'mode=%s item=%s sent=%d/%d received=%d/%d inventory=%d potpourri=%s verified=%s',
         session.mode,
         tostring(session.item_name),
-        session.purchased,
+        session.sent_count,
+        session.requested,
+        session.acked_count,
         session.requested,
         current,
-        pot
+        pot,
+        tostring(session.template_verified)
     ))
-
-    if session.mode == 'teaching' then
-        chat('Last manual Emporox menu packet: ' .. packet_summary(session.candidate))
-    elseif session.template then
-        chat('Learned purchase packet: ' .. packet_summary(session.template))
-    end
 end
 
 local function show_help()
-    chat('//emps buy <item name> <quantity> - learn one manual Emporox purchase, then safely repeat it.')
+    chat('//emps buy <item name> <quantity> - learn one manual Emporox purchase, then repeat it.')
     chat('Example: //emps buy Ghastly Stone 200')
-    chat('//emps status - show current state.')
+    chat('//emps status - show sent/received progress.')
     chat('//emps stop - immediately stop automation.')
-    chat('Safety: every repeated purchase waits for exact-item 0x01F/0x020 inventory acknowledgement; timeouts never auto-retry.')
+    chat('Safety: Emporox 0x05C advances purchases; exact-item inventory packets audit every result.')
 end
 
 windower.register_event('addon command', function(...)
@@ -397,9 +383,6 @@ windower.register_event('addon command', function(...)
             abort_session('cancelled by user')
         end
 
-    elseif command == 'help' then
-        show_help()
-
     else
         show_help()
     end
@@ -409,7 +392,6 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
     if id ~= 0x05B or session.mode == 'idle' or blocked then
         return
     end
-
     if injected then
         return
     end
@@ -427,37 +409,29 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
         return
     end
 
-    -- When Emporox's 0x05C continuation reaches the normal client, the event
-    -- script emits this cleanup/return-to-list response. During an intermediate
-    -- bulk purchase that would leave the confirmation state we deliberately
-    -- preserve, so block it. Check this before teaching capture so cleanup can
-    -- never replace the learned Yes packet.
     local is_cleanup =
         tonumber(p['Option Index']) == 0 and
         tonumber(p['_unknown1']) == 16384 and
         not p['Automated Message']
 
-    if is_cleanup and session.active_purchase_number and
-       session.active_purchase_number < session.requested then
+    -- Intermediate 0x05C packets are blocked, so this normally never appears.
+    -- Keep the guard as a second line of defense while purchases remain.
+    if is_cleanup and session.sent_count < session.requested then
         chat('Blocked intermediate Emporox dialog cleanup.')
         return true
     end
 
     if session.mode == 'teaching' then
         session.candidate = copy_menu_packet(p)
-        -- This manual menu response begins the transaction we are learning.
-        -- Reset both completion signals so only packets following this choice
-        -- can release the next automated purchase.
-        session.item_ack_seen = false
-        session.dialog_ready_seen = false
-        session.active_purchase_number = 1
-        session.ack_deadline = now() + ACK_TIMEOUT_SECONDS
-        chat('Observed manual Emporox menu selection: ' .. packet_summary(session.candidate))
+        session.template = session.candidate
+        session.sent_count = 1
+        session.deadline = now() + PROGRESS_TIMEOUT_SECONDS
+
+        chat('Observed manual Emporox purchase response: ' .. packet_summary(session.template))
         return
     end
 
-    if session.mode == 'settling' then
-        chat('Ignoring post-purchase Emporox menu traffic: ' .. packet_summary(p))
+    if session.mode == 'draining' and is_cleanup then
         return
     end
 
@@ -473,44 +447,51 @@ windower.register_event('incoming chunk', function(id, data)
         return
     end
 
-    -- Emporox keeps the event menu open between purchases. 0x05C is the
-    -- server-side continuation/refresh signal used by this style of dialog.
-    -- Do not send another purchase merely because the inventory item arrived;
-    -- wait until this continuation has also arrived.
-    if id == 0x05C and session.mode ~= 'idle' then
-        if session.mode == 'teaching' or session.mode == 'waiting' then
-            session.dialog_ready_seen = true
+    if session.mode == 'idle' then
+        return
+    end
 
-            local purchase_number = session.active_purchase_number or (session.purchased + 1)
-            local intermediate = purchase_number < session.requested
+    -- Emporox sends 0x05C when the current Yes response has advanced.
+    -- The known-working bulk sequence sends the next identical 0x05B directly
+    -- from this callback, before allowing the client event script to consume
+    -- the continuation.
+    if id == 0x05C then
+        if not session.template then
+            abort_session('Emporox continued before a purchase response was learned')
+            return true
+        end
 
-            if intermediate then
-                chat(string.format(
-                    'Emporox dialog continuation received (0x05C); holding confirmation state for purchase %d/%d.',
-                    purchase_number,
-                    session.requested
-                ))
-            else
-                chat('Final Emporox dialog continuation received (0x05C); allowing normal menu cleanup.')
-            end
+        local completed_number = session.sent_count
+        session.deadline = now() + PROGRESS_TIMEOUT_SECONDS
 
-            maybe_schedule_next()
+        if completed_number < session.requested then
+            chat(string.format(
+                'Emporox continuation for purchase %d/%d; chaining next purchase now.',
+                completed_number,
+                session.requested
+            ))
 
-            -- Critical for bulk replay: do not let the normal client consume
-            -- intermediate continuations. If it does, its event script returns
-            -- to the item list and the learned Yes packet is no longer valid.
-            -- Allow the final continuation through so the UI returns to normal.
-            if intermediate then
-                return true
-            end
+            inject_next_purchase()
+
+            -- Keep the client in the confirmation event state. The next
+            -- purchase has already been sent above.
+            return true
+        end
+
+        -- The requested number of purchase responses has now been accepted.
+        -- Let the final continuation reach the normal client so its menu can
+        -- return to the item list while we wait for any trailing item ACK.
+        session.mode = 'draining'
+        chat('Final Emporox continuation received; allowing normal menu cleanup.')
+
+        if session.acked_count >= session.requested then
+            finish_success()
         end
         return
     end
 
-    -- A brand-new inventory stack arrives as 0x01F (Item Assign). Updates to an
-    -- existing stack arrive as 0x020 (Item Update). Emporox can legitimately
-    -- produce either depending on whether this is the first stone in the slot.
-    if (id ~= 0x01F and id ~= 0x020) or session.mode == 'idle' then
+    -- A new inventory stack is 0x01F; an existing stack update is 0x020.
+    if id ~= 0x01F and id ~= 0x020 then
         return
     end
 
@@ -518,55 +499,41 @@ windower.register_event('incoming chunk', function(id, data)
     if not ok or not p then
         return
     end
-
     if tonumber(p['Item']) ~= tonumber(session.item_id) then
         return
     end
 
-    session.last_ack_packet = id
+    -- One exact-item packet is expected for each Emporox purchase. Never let
+    -- acknowledgements outrun purchase responses.
+    if session.acked_count < session.sent_count then
+        session.acked_count = session.acked_count + 1
+    end
+    session.deadline = now() + PROGRESS_TIMEOUT_SECONDS
 
-    if session.mode == 'teaching' then
-        if not session.candidate then
-            abort_session('received the requested item, but no Emporox menu packet was captured')
-            return
-        end
-
-        session.template = session.candidate
-        session.candidate = nil
-        session.purchased = 1
-        session.item_ack_seen = true
-
+    if not session.template_verified then
+        session.template_verified = true
         chat(string.format(
-            'Teaching purchase verified by exact item receive packet 0x%03X.',
+            'Learned purchase response verified by exact item packet 0x%03X.',
             id
         ))
-        chat('Learned purchase packet: ' .. packet_summary(session.template))
-
-        maybe_schedule_next()
-        return
     end
 
-    if session.mode == 'waiting' then
-        if session.item_ack_seen then
-            return
-        end
+    chat(string.format(
+        'Item ACK %d/%d for %s via 0x%03X (packet count=%s).',
+        session.acked_count,
+        session.requested,
+        session.item_name,
+        id,
+        tostring(p['Count'])
+    ))
 
-        session.item_ack_seen = true
-        session.purchased = session.purchased + 1
-        chat(string.format(
-            'ACK %d/%d: received %s via 0x%03X (packet count=%s).',
-            session.purchased,
-            session.requested,
-            session.item_name,
-            id,
-            tostring(p['Count'])
-        ))
-        maybe_schedule_next()
+    if session.mode == 'draining' and session.acked_count >= session.requested then
+        finish_success()
     end
 end)
 
 windower.register_event('prerender', function()
-    if session.mode == 'idle' then
+    if session.mode == 'idle' or not session.deadline then
         return
     end
 
@@ -576,26 +543,14 @@ windower.register_event('prerender', function()
     end
     session.last_tick = t
 
-    if session.mode == 'settling' and session.next_send_at and t >= session.next_send_at then
-        inject_purchase()
-        return
-    end
-
-    if (session.mode == 'waiting' or session.mode == 'teaching') and
-       session.ack_deadline and t >= session.ack_deadline then
-        local missing = {}
-        if not session.item_ack_seen then
-            missing[#missing + 1] = 'item ACK'
-        end
-        if not session.dialog_ready_seen then
-            missing[#missing + 1] = '0x05C dialog continuation'
-        end
-
+    if t >= session.deadline then
         abort_session(string.format(
-            'timed out waiting %.2fs for %s (%s); no retry was sent',
-            ACK_TIMEOUT_SECONDS,
-            session.item_name,
-            table.concat(missing, ' + ')
+            'no Emporox progress for %.2fs (sent %d/%d, received %d/%d)',
+            PROGRESS_TIMEOUT_SECONDS,
+            session.sent_count,
+            session.requested,
+            session.acked_count,
+            session.requested
         ))
     end
 end)
