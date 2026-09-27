@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.2.1'
+_addon.version = '0.2.2'
 _addon.commands = {'emps','emporoxshop'}
 
 local packets = require('packets')
@@ -21,7 +21,7 @@ local s = {
     mode='idle', qty=0, sent=0, acks=0, cleanup=false,
     npc_id=nil, npc_index=nil, menu=nil, deadline=nil,
     open_attempts=0, last_open=nil, last_tick=0, last_raw={},
-    start_count=0, last_potpourri=nil,
+    start_count=0, last_potpourri=nil, recover_deadline=nil,
 }
 
 local function now()
@@ -52,7 +52,7 @@ local function reset()
         mode='idle', qty=0, sent=0, acks=0, cleanup=false,
         npc_id=nil, npc_index=nil, menu=nil, deadline=nil,
         open_attempts=0, last_open=nil, last_tick=0, last_raw={},
-        start_count=0, last_potpourri=pot,
+        start_count=0, last_potpourri=pot, recover_deadline=nil,
     }
 end
 
@@ -91,8 +91,8 @@ local function valid_target()
     return npc
 end
 
-local function cleanup()
-    if s.cleanup or not s.menu then return end
+local function send_cancel(menu_id)
+    if not s.npc_id or not s.npc_index then return end
     packets.inject(packets.new('outgoing',0x05B,{
         ['Target']=s.npc_id,
         ['Option Index']=0,
@@ -101,12 +101,29 @@ local function cleanup()
         ['Automated Message']=false,
         ['_unknown2']=0,
         ['Zone']=ZONE,
-        ['Menu ID']=s.menu,
+        ['Menu ID']=menu_id or MENU,
     }))
+end
+
+local function cleanup()
+    if s.cleanup or not s.menu then return end
+    send_cancel(s.menu)
     s.cleanup = true
     s.mode = 'closing'
     s.deadline = now()+TIMEOUT
     chat('Sent menu cleanup.')
+end
+
+local function begin_recovery()
+    local player=windower.ffxi.get_player()
+    local status=player and tonumber(player.status) or -1
+    s.mode='recovering'
+    s.menu=MENU
+    s.cleanup=false
+    s.recover_deadline=now()+2.0
+    s.deadline=nil
+    chat(string.format('Preflight found player status=%s; clearing stale Emporox dialog first.',tostring(status)),167)
+    send_cancel(MENU)
 end
 
 local function finish_or_drain(release_type)
@@ -195,9 +212,18 @@ local function start(qty)
     s.last_raw = {}
     s.start_count = item_count()
 
+    local player=windower.ffxi.get_player()
+    local status=player and tonumber(player.status) or -1
+
     chat(string.format('Starting %d x Ghastly Stone using Silmaril sequence.',qty))
+    chat(string.format('Preflight player status=%s.',tostring(status)))
     chat('No manual menu selection is required.')
-    poke()
+
+    if status==4 then
+        begin_recovery()
+    else
+        poke()
+    end
 end
 
 windower.register_event('addon command',function(...)
@@ -241,6 +267,19 @@ windower.register_event('incoming chunk',function(id,data)
         return
     end
     if s.mode=='idle' then return end
+
+    if id==0x052 and s.mode=='recovering' then
+        if same_packet(id,data) then return end
+        chat('Stale Emporox dialog released; retrying from clean state.')
+        s.mode='opening'
+        s.menu=nil
+        s.cleanup=false
+        s.recover_deadline=nil
+        s.open_attempts=0
+        s.last_raw={}
+        poke()
+        return
+    end
 
     if id==0x032 or id==0x033 or id==0x034 then
         if same_packet(id,data) then return true end
@@ -334,8 +373,34 @@ windower.register_event('prerender',function()
     if t-(s.last_tick or 0)<0.05 then return end
     s.last_tick=t
 
+    if s.mode=='recovering' then
+        local player=windower.ffxi.get_player()
+        local status=player and tonumber(player.status) or -1
+        if status~=4 then
+            chat(string.format('Preflight recovery complete; player status=%s.',tostring(status)))
+            s.mode='opening'
+            s.menu=nil
+            s.cleanup=false
+            s.recover_deadline=nil
+            s.open_attempts=0
+            s.last_raw={}
+            poke()
+        elseif s.recover_deadline and t>=s.recover_deadline then
+            stop('client remained stuck in menu/event status after Emporox reset')
+        end
+        return
+    end
+
     if s.mode=='opening' and s.last_open and t-s.last_open>=OPEN_RETRY then
-        if s.open_attempts>=MAX_OPEN then stop('Emporox did not return an opening menu') else poke() end
+        local player=windower.ffxi.get_player()
+        local status=player and tonumber(player.status) or -1
+        if status==4 then
+            begin_recovery()
+        elseif s.open_attempts>=MAX_OPEN then
+            stop('Emporox did not return an opening menu; player status='..tostring(status))
+        else
+            poke()
+        end
         return
     end
 
