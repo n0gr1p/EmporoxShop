@@ -427,6 +427,22 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
         return
     end
 
+    -- When Emporox's 0x05C continuation reaches the normal client, the event
+    -- script emits this cleanup/return-to-list response. During an intermediate
+    -- bulk purchase that would leave the confirmation state we deliberately
+    -- preserve, so block it. Check this before teaching capture so cleanup can
+    -- never replace the learned Yes packet.
+    local is_cleanup =
+        tonumber(p['Option Index']) == 0 and
+        tonumber(p['_unknown1']) == 16384 and
+        not p['Automated Message']
+
+    if is_cleanup and session.active_purchase_number and
+       session.active_purchase_number < session.requested then
+        chat('Blocked intermediate Emporox dialog cleanup.')
+        return true
+    end
+
     if session.mode == 'teaching' then
         session.candidate = copy_menu_packet(p)
         -- This manual menu response begins the transaction we are learning.
@@ -438,21 +454,6 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
         session.ack_deadline = now() + ACK_TIMEOUT_SECONDS
         chat('Observed manual Emporox menu selection: ' .. packet_summary(session.candidate))
         return
-    end
-
-    -- When Emporox's 0x05C continuation reaches the normal client, the event
-    -- script emits this cleanup/return-to-list response. During an intermediate
-    -- bulk purchase that would leave the confirmation state we deliberately
-    -- preserve, so block it. The final purchase is allowed to clean up normally.
-    local is_cleanup =
-        tonumber(p['Option Index']) == 0 and
-        tonumber(p['_unknown1']) == 16384 and
-        not p['Automated Message']
-
-    if is_cleanup and session.active_purchase_number and
-       session.active_purchase_number < session.requested then
-        chat('Blocked intermediate Emporox dialog cleanup.')
-        return true
     end
 
     if session.mode == 'settling' then
