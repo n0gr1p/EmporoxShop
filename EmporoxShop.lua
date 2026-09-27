@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.2.2'
+_addon.version = '0.2.3'
 _addon.commands = {'emps','emporoxshop'}
 
 local packets = require('packets')
@@ -14,6 +14,7 @@ local OPTION = 3
 local UNKNOWN1 = 6
 local MAX_DISTANCE = 6
 local TIMEOUT = 4
+local DRAIN_TIMEOUT = 10
 local OPEN_RETRY = 1.5
 local MAX_OPEN = 4
 
@@ -44,6 +45,13 @@ local function item_count()
         end
     end
     return n
+end
+
+local function confirmed_count()
+    local gained = item_count() - (s.start_count or 0)
+    if gained < 0 then gained = 0 end
+    if s.qty and gained > s.qty then gained = s.qty end
+    return gained
 end
 
 local function reset()
@@ -127,19 +135,23 @@ local function begin_recovery()
 end
 
 local function finish_or_drain(release_type)
-    if s.acks >= s.qty then
-        local current=item_count()
-        chat(string.format('Complete: sent %d/%d, item ACKs %d/%d, inventory %d -> %d.',
-            s.sent,s.qty,s.acks,s.qty,s.start_count,current),158)
+    local current=item_count()
+    local confirmed=confirmed_count()
+    s.acks=confirmed
+
+    if confirmed >= s.qty then
+        chat(string.format(
+            'Complete: sent %d/%d, inventory confirmed %d/%d, inventory %d -> %d.',
+            s.sent,s.qty,confirmed,s.qty,s.start_count,current),158)
         reset()
         return
     end
 
     s.mode='draining'
-    s.deadline=now()+TIMEOUT
+    s.deadline=now()+DRAIN_TIMEOUT
     chat(string.format(
-        'Emporox transaction queue complete (release type=%s); waiting for %d trailing item ACK(s).',
-        tostring(release_type), s.qty-s.acks))
+        'Emporox transaction queue complete (release type=%s); inventory confirms %d/%d. Waiting for inventory sync.',
+        tostring(release_type),confirmed,s.qty))
 end
 
 local function stop(reason)
@@ -239,8 +251,11 @@ windower.register_event('addon command',function(...)
         end
         start(qty)
     elseif cmd=='status' then
-        chat(string.format('mode=%s sent=%d/%d acks=%d inventory=%d menu=%s cleanup=%s',
-            s.mode,s.sent,s.qty,s.acks,item_count(),tostring(s.menu),tostring(s.cleanup)))
+        local current=item_count()
+        local confirmed=confirmed_count()
+        chat(string.format(
+            'mode=%s sent=%d/%d inventory_confirmed=%d/%d inventory=%d menu=%s cleanup=%s',
+            s.mode,s.sent,s.qty,confirmed,s.qty,current,tostring(s.menu),tostring(s.cleanup)))
     elseif cmd=='stop' or cmd=='cancel' then
         stop('cancelled by user')
     else
@@ -317,12 +332,18 @@ windower.register_event('incoming chunk',function(id,data)
     if id==0x01F or id==0x020 then
         local ok,p=pcall(packets.parse,'incoming',data)
         if ok and p and tonumber(p['Item'])==ITEM_ID then
-            s.acks=s.acks+1
-            s.deadline=now()+TIMEOUT
-            chat(string.format('Item ACK %d/%d via 0x%03X.',s.acks,s.qty,id))
+            local confirmed=confirmed_count()
+            if confirmed > s.acks then
+                s.acks=confirmed
+                chat(string.format(
+                    'Inventory confirmed %d/%d Ghastly Stones (0x%03X stack count=%s).',
+                    s.acks,s.qty,id,tostring(p['Count'])))
+            end
+
+            s.deadline=now()+(s.mode=='draining' and DRAIN_TIMEOUT or TIMEOUT)
 
             if s.mode=='draining' and s.acks>=s.qty then
-                finish_or_drain('drain')
+                finish_or_drain('inventory')
             end
         end
         return
@@ -391,6 +412,18 @@ windower.register_event('prerender',function()
         return
     end
 
+    if s.mode=='draining' then
+        local confirmed=confirmed_count()
+        if confirmed>s.acks then
+            s.acks=confirmed
+            chat(string.format('Inventory confirmed %d/%d Ghastly Stones.',s.acks,s.qty))
+        end
+        if confirmed>=s.qty then
+            finish_or_drain('inventory-poll')
+            return
+        end
+    end
+
     if s.mode=='opening' and s.last_open and t-s.last_open>=OPEN_RETRY then
         local player=windower.ffxi.get_player()
         local status=player and tonumber(player.status) or -1
@@ -407,10 +440,15 @@ windower.register_event('prerender',function()
     if s.mode~='opening' and s.deadline and t>=s.deadline then
         if s.mode=='draining' then
             local current=item_count()
-            chat(string.format(
-                'Finished queue, but item ACK drain timed out: sent %d/%d, ACKs %d/%d, inventory %d -> %d.',
-                s.sent,s.qty,s.acks,s.qty,s.start_count,current),167)
-            reset()
+            local confirmed=confirmed_count()
+            if confirmed>=s.qty then
+                finish_or_drain('inventory-poll')
+            else
+                chat(string.format(
+                    'Finished queue, but inventory sync timed out: sent %d/%d, confirmed %d/%d, inventory %d -> %d.',
+                    s.sent,s.qty,confirmed,s.qty,s.start_count,current),167)
+                reset()
+            end
         else
             stop(string.format('no Emporox progress for %.1fs (mode=%s sent=%d/%d acks=%d)',
                 TIMEOUT,s.mode,s.sent,s.qty,s.acks))
