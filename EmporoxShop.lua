@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.1.0'
+_addon.version = '0.1.1'
 _addon.commands = {'emps', 'emporoxshop'}
 
 local packets = require('packets')
@@ -9,7 +9,7 @@ local socket_ok, socket = pcall(require, 'socket')
 
 local EMPOROX_NAME = 'Emporox'
 local MAX_NPC_DISTANCE = 6.0
-local PURCHASE_DELAY_SECONDS = 0.20
+local PURCHASE_DELAY_SECONDS = 0.50
 local ACK_TIMEOUT_SECONDS = 2.50
 local TICK_SECONDS = 0.05
 
@@ -44,6 +44,7 @@ local session = {
     last_tick = 0,
     last_potpourri = nil,
     started_inventory_count = 0,
+    last_ack_packet = nil,
 }
 
 local function clear_session()
@@ -61,6 +62,7 @@ local function clear_session()
     session.ack_deadline = nil
     session.last_tick = 0
     session.started_inventory_count = 0
+    session.last_ack_packet = nil
 end
 
 local function abort_session(reason)
@@ -216,7 +218,10 @@ local function schedule_next()
         return
     end
 
-    session.mode = 'ready'
+    -- Give Emporox's client-side menu cleanup a brief window to finish before
+    -- the next injected purchase. Menu traffic during this settling window is
+    -- expected and must not be mistaken for user interference.
+    session.mode = 'settling'
     session.next_send_at = now() + PURCHASE_DELAY_SECONDS
     session.ack_deadline = nil
 end
@@ -340,7 +345,7 @@ local function show_help()
     chat('Example: //emps buy Ghastly Stone 200')
     chat('//emps status - show current state.')
     chat('//emps stop - immediately stop automation.')
-    chat('Safety: every repeated purchase waits for an incoming item packet for the exact requested item; timeouts never auto-retry.')
+    chat('Safety: every repeated purchase waits for exact-item 0x01F/0x020 inventory acknowledgement; timeouts never auto-retry.')
 end
 
 windower.register_event('addon command', function(...)
@@ -411,8 +416,15 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
         return
     end
 
-    -- Once replay has started, any manual menu input means the player is taking
-    -- control. Stop instead of competing with their menu actions.
+    -- Emporox may emit one final non-injected menu response immediately after
+    -- an item is received. Ignore that expected cleanup during the short
+    -- settling window. Outside that window, manual input means the player is
+    -- taking control, so stop instead of competing with it.
+    if session.mode == 'settling' then
+        chat('Ignoring post-purchase Emporox menu cleanup: ' .. packet_summary(p))
+        return
+    end
+
     abort_session('manual Emporox menu input detected during replay')
 end)
 
@@ -425,7 +437,10 @@ windower.register_event('incoming chunk', function(id, data)
         return
     end
 
-    if id ~= 0x020 or session.mode == 'idle' then
+    -- A brand-new inventory stack arrives as 0x01F (Item Assign). Updates to an
+    -- existing stack arrive as 0x020 (Item Update). Emporox can legitimately
+    -- produce either depending on whether this is the first stone in the slot.
+    if (id ~= 0x01F and id ~= 0x020) or session.mode == 'idle' then
         return
     end
 
@@ -438,6 +453,8 @@ windower.register_event('incoming chunk', function(id, data)
         return
     end
 
+    session.last_ack_packet = id
+
     if session.mode == 'teaching' then
         if not session.candidate then
             abort_session('received the requested item, but no Emporox menu packet was captured')
@@ -448,7 +465,10 @@ windower.register_event('incoming chunk', function(id, data)
         session.candidate = nil
         session.purchased = 1
 
-        chat('Teaching purchase verified by exact item receive packet.')
+        chat(string.format(
+            'Teaching purchase verified by exact item receive packet 0x%03X.',
+            id
+        ))
         chat('Learned purchase packet: ' .. packet_summary(session.template))
 
         schedule_next()
@@ -458,10 +478,11 @@ windower.register_event('incoming chunk', function(id, data)
     if session.mode == 'waiting' then
         session.purchased = session.purchased + 1
         chat(string.format(
-            'ACK %d/%d: received %s (packet count=%s).',
+            'ACK %d/%d: received %s via 0x%03X (packet count=%s).',
             session.purchased,
             session.requested,
             session.item_name,
+            id,
             tostring(p['Count'])
         ))
         schedule_next()
@@ -479,7 +500,7 @@ windower.register_event('prerender', function()
     end
     session.last_tick = t
 
-    if session.mode == 'ready' and session.next_send_at and t >= session.next_send_at then
+    if session.mode == 'settling' and session.next_send_at and t >= session.next_send_at then
         inject_purchase()
         return
     end
