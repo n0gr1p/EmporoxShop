@@ -38,6 +38,7 @@ local function chat(msg,color)
 end
 
 local function item_count()
+    if not s.purchase then return 0 end
     local items = windower.ffxi.get_items()
     local inv = items and items.inventory
     if not inv then return 0 end
