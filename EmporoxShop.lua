@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.2.0'
+_addon.version = '0.2.1'
 _addon.commands = {'emps','emporoxshop'}
 
 local packets = require('packets')
@@ -107,6 +107,22 @@ local function cleanup()
     s.mode = 'closing'
     s.deadline = now()+TIMEOUT
     chat('Sent menu cleanup.')
+end
+
+local function finish_or_drain(release_type)
+    if s.acks >= s.qty then
+        local current=item_count()
+        chat(string.format('Complete: sent %d/%d, item ACKs %d/%d, inventory %d -> %d.',
+            s.sent,s.qty,s.acks,s.qty,s.start_count,current),158)
+        reset()
+        return
+    end
+
+    s.mode='draining'
+    s.deadline=now()+TIMEOUT
+    chat(string.format(
+        'Emporox transaction queue complete (release type=%s); waiting for %d trailing item ACK(s).',
+        tostring(release_type), s.qty-s.acks))
 end
 
 local function stop(reason)
@@ -265,15 +281,50 @@ windower.register_event('incoming chunk',function(id,data)
             s.acks=s.acks+1
             s.deadline=now()+TIMEOUT
             chat(string.format('Item ACK %d/%d via 0x%03X.',s.acks,s.qty,id))
+
+            if s.mode=='draining' and s.acks>=s.qty then
+                finish_or_drain('drain')
+            end
         end
         return
     end
 
-    if id==0x052 and (s.mode=='running' or s.mode=='closing' or s.mode=='await_release') then
-        local current=item_count()
-        chat(string.format('Complete: sent %d/%d, item ACKs %d/%d, inventory %d -> %d.',
-            s.sent,s.qty,s.acks,s.qty,s.start_count,current),158)
-        reset()
+    if id==0x052 and
+       (s.mode=='running' or s.mode=='closing' or s.mode=='await_release' or s.mode=='draining') then
+        if same_packet(id,data) then return end
+
+        local ok,p=pcall(packets.parse,'incoming',data)
+        if not ok or not p then return end
+        local release_type=tonumber(p['Type'])
+
+        chat(string.format('Emporox release type=%s (sent=%d/%d cleanup=%s).',
+            tostring(release_type),s.sent,s.qty,tostring(s.cleanup)))
+
+        if release_type==0 then
+            -- Silmaril: standard release only completes when the queue is empty.
+            if s.cleanup then
+                finish_or_drain(release_type)
+            end
+
+        elseif release_type==1 then
+            -- Silmaril: event release advances the next queued message.
+            if s.cleanup then
+                finish_or_drain(release_type)
+            else
+                send_next()
+            end
+
+        elseif release_type==2 then
+            stop('Emporox returned event-skip release')
+
+        elseif release_type==3 or release_type==4 then
+            finish_or_drain(release_type)
+
+        else
+            stop('unexpected Emporox release type '..tostring(release_type))
+        end
+
+        return
     end
 end)
 
@@ -289,8 +340,16 @@ windower.register_event('prerender',function()
     end
 
     if s.mode~='opening' and s.deadline and t>=s.deadline then
-        stop(string.format('no Emporox progress for %.1fs (mode=%s sent=%d/%d acks=%d)',
-            TIMEOUT,s.mode,s.sent,s.qty,s.acks))
+        if s.mode=='draining' then
+            local current=item_count()
+            chat(string.format(
+                'Finished queue, but item ACK drain timed out: sent %d/%d, ACKs %d/%d, inventory %d -> %d.',
+                s.sent,s.qty,s.acks,s.qty,s.start_count,current),167)
+            reset()
+        else
+            stop(string.format('no Emporox progress for %.1fs (mode=%s sent=%d/%d acks=%d)',
+                TIMEOUT,s.mode,s.sent,s.qty,s.acks))
+        end
     end
 end)
 
