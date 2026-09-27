@@ -1,6 +1,6 @@
 _addon.name = 'EmporoxShop'
 _addon.author = 'n0gr1p + OpenAI'
-_addon.version = '0.1.1'
+_addon.version = '0.1.2'
 _addon.commands = {'emps', 'emporoxshop'}
 
 local packets = require('packets')
@@ -9,8 +9,8 @@ local socket_ok, socket = pcall(require, 'socket')
 
 local EMPOROX_NAME = 'Emporox'
 local MAX_NPC_DISTANCE = 6.0
-local PURCHASE_DELAY_SECONDS = 0.50
-local ACK_TIMEOUT_SECONDS = 2.50
+local PURCHASE_DELAY_SECONDS = 0.10
+local ACK_TIMEOUT_SECONDS = 4.00
 local TICK_SECONDS = 0.05
 
 local function now()
@@ -45,6 +45,8 @@ local session = {
     last_potpourri = nil,
     started_inventory_count = 0,
     last_ack_packet = nil,
+    item_ack_seen = false,
+    dialog_ready_seen = false,
 }
 
 local function clear_session()
@@ -63,6 +65,8 @@ local function clear_session()
     session.last_tick = 0
     session.started_inventory_count = 0
     session.last_ack_packet = nil
+    session.item_ack_seen = false
+    session.dialog_ready_seen = false
 end
 
 local function abort_session(reason)
@@ -212,15 +216,19 @@ local function finish_success()
     clear_session()
 end
 
-local function schedule_next()
+local function maybe_schedule_next()
+    if not session.item_ack_seen or not session.dialog_ready_seen then
+        return
+    end
+
     if session.purchased >= session.requested then
         finish_success()
         return
     end
 
-    -- Give Emporox's client-side menu cleanup a brief window to finish before
-    -- the next injected purchase. Menu traffic during this settling window is
-    -- expected and must not be mistaken for user interference.
+    -- The item receipt proves the purchase succeeded. Incoming 0x05C proves
+    -- Emporox's dialog event has advanced and is ready to accept the next
+    -- identical menu response. Only advance when both have happened.
     session.mode = 'settling'
     session.next_send_at = now() + PURCHASE_DELAY_SECONDS
     session.ack_deadline = nil
@@ -238,6 +246,9 @@ local function inject_purchase()
     end
 
     local before = inventory_item_count(session.item_id)
+    session.item_ack_seen = false
+    session.dialog_ready_seen = false
+
     local packet = packets.new('outgoing', 0x05B, session.template)
     packets.inject(packet)
 
@@ -300,6 +311,8 @@ local function begin_buy(item_name, quantity)
     session.next_send_at = nil
     session.ack_deadline = nil
     session.started_inventory_count = inventory_item_count(item_id)
+    session.item_ack_seen = false
+    session.dialog_ready_seen = false
 
     chat(string.format(
         'Armed for %d x %s (item id %d). Emporox is %.2f yalms away.',
@@ -412,6 +425,12 @@ windower.register_event('outgoing chunk', function(id, original, modified, injec
 
     if session.mode == 'teaching' then
         session.candidate = copy_menu_packet(p)
+        -- This manual menu response begins the transaction we are learning.
+        -- Reset both completion signals so only packets following this choice
+        -- can release the next automated purchase.
+        session.item_ack_seen = false
+        session.dialog_ready_seen = false
+        session.ack_deadline = now() + ACK_TIMEOUT_SECONDS
         chat('Observed manual Emporox menu selection: ' .. packet_summary(session.candidate))
         return
     end
@@ -433,6 +452,19 @@ windower.register_event('incoming chunk', function(id, data)
         local ok, p = pcall(packets.parse, 'incoming', data)
         if ok and p and p['Potpourri'] ~= nil then
             session.last_potpourri = tonumber(p['Potpourri'])
+        end
+        return
+    end
+
+    -- Emporox keeps the event menu open between purchases. 0x05C is the
+    -- server-side continuation/refresh signal used by this style of dialog.
+    -- Do not send another purchase merely because the inventory item arrived;
+    -- wait until this continuation has also arrived.
+    if id == 0x05C and session.mode ~= 'idle' then
+        if session.mode == 'teaching' or session.mode == 'waiting' then
+            session.dialog_ready_seen = true
+            chat('Emporox dialog continuation received (0x05C).')
+            maybe_schedule_next()
         end
         return
     end
@@ -464,6 +496,7 @@ windower.register_event('incoming chunk', function(id, data)
         session.template = session.candidate
         session.candidate = nil
         session.purchased = 1
+        session.item_ack_seen = true
 
         chat(string.format(
             'Teaching purchase verified by exact item receive packet 0x%03X.',
@@ -471,11 +504,16 @@ windower.register_event('incoming chunk', function(id, data)
         ))
         chat('Learned purchase packet: ' .. packet_summary(session.template))
 
-        schedule_next()
+        maybe_schedule_next()
         return
     end
 
     if session.mode == 'waiting' then
+        if session.item_ack_seen then
+            return
+        end
+
+        session.item_ack_seen = true
         session.purchased = session.purchased + 1
         chat(string.format(
             'ACK %d/%d: received %s via 0x%03X (packet count=%s).',
@@ -485,7 +523,7 @@ windower.register_event('incoming chunk', function(id, data)
             id,
             tostring(p['Count'])
         ))
-        schedule_next()
+        maybe_schedule_next()
     end
 end)
 
@@ -505,11 +543,21 @@ windower.register_event('prerender', function()
         return
     end
 
-    if session.mode == 'waiting' and session.ack_deadline and t >= session.ack_deadline then
+    if (session.mode == 'waiting' or session.mode == 'teaching') and
+       session.ack_deadline and t >= session.ack_deadline then
+        local missing = {}
+        if not session.item_ack_seen then
+            missing[#missing + 1] = 'item ACK'
+        end
+        if not session.dialog_ready_seen then
+            missing[#missing + 1] = '0x05C dialog continuation'
+        end
+
         abort_session(string.format(
-            'timed out waiting %.2fs for %s; no retry was sent',
+            'timed out waiting %.2fs for %s (%s); no retry was sent',
             ACK_TIMEOUT_SECONDS,
-            session.item_name
+            session.item_name,
+            table.concat(missing, ' + ')
         ))
     end
 end)
